@@ -310,3 +310,4 @@ def build_from_dir(proj_dir: Path, opts: BuildOptions, log_cb=None, phase_cb=Non
 
     phase(100)
     return out_dir
+
