@@ -27,7 +27,11 @@ class BuildSignals(QtCore.QObject):
 
 
 def _emit(log_cb, msg: str):
-    (log_cb or print)(msg, flush=True)
+    # FIX: si hay callback (lambda), no pasar flush
+    if log_cb:
+        log_cb(msg)
+    else:
+        print(msg, flush=True)
 
 
 def _run(cmd: list[str], cwd: Path | None, env: dict | None, log_cb) -> int:
@@ -63,17 +67,17 @@ def _detect_root_with_app_py(root: Path) -> Path:
     return root
 
 
-# ===================== NUEVA IMPLEMENTACIÓN ROBUSTA =====================
+# ===================== IMPLEMENTACIÓN ROBUSTA DE venv =====================
 
 def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
     """
-    Busca un intérprete de Python 3.10–3.12 en Windows de forma robusta y crea un venv.
-    Orden de búsqueda:
-      1) py -0p   (launcher oficial; lista rutas instaladas)
-      2) py -3.12 / -3.11 / -3.10
+    Busca un intérprete de Python 3.10–3.12 y crea un venv.
+    Orden de búsqueda (Windows):
+      1) py -0p (lista rutas)
+      2) py -3.12/-3.11/-3.10
       3) where python / where py
-      4) Escaneo de rutas típicas (AppData y Program Files)
-    En Linux/WSL/macOS, también intentará 'python3'.
+      4) rutas típicas (AppData/Program Files)
+    En otros OS: which python3.12/3.11/3.10/python3/python.
     Devuelve: (ruta_python_del_venv, comando_pip_del_venv)
     """
     import re
@@ -89,11 +93,10 @@ def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
 
     candidates: list[list[str]] = []
 
-    # 1) py -0p (si existe launcher)
+    # 1) py -0p
     if which("py"):
         try:
             out = subprocess.check_output(["py", "-0p"], text=True, stderr=subprocess.STDOUT)
-            # Líneas tipo: " -3.12-64  C:\Path\Python312\python.exe"
             for line in out.splitlines():
                 m = re.search(r"(\d\.\d+).*(python\.exe)", line, re.I)
                 if m:
@@ -103,11 +106,11 @@ def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
                         candidates.append([path])
         except Exception:
             pass
-        # 2) py -3.12/-3.11/-3.10
+        # 2) py -3.x
         for v in ("3.12", "3.11", "3.10"):
             candidates.append(["py", f"-{v}"])
 
-    # 3) where python / where py (Windows) o which python3/python (otros)
+    # 3) where/which
     if os.name == "nt":
         for exe in ("python", "py"):
             try:
@@ -126,13 +129,17 @@ def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
             if which(exe):
                 candidates.append([exe])
 
-    # 4) Rutas típicas de instalación en Windows
+    # 4) rutas típicas Windows
     if os.name == "nt":
-        probable_dirs = []
-        for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)")):
+        probable = []
+        for base in (
+            os.environ.get("LOCALAPPDATA"),
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+        ):
             if not base:
                 continue
-            probable_dirs += [
+            probable += [
                 Path(base) / "Programs" / "Python" / "Python312" / "python.exe",
                 Path(base) / "Programs" / "Python" / "Python311" / "python.exe",
                 Path(base) / "Programs" / "Python" / "Python310" / "python.exe",
@@ -140,24 +147,23 @@ def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
                 Path(base) / "Python311" / "python.exe",
                 Path(base) / "Python310" / "python.exe",
             ]
-        for p in probable_dirs:
+        for p in probable:
             if p.exists():
                 candidates.append([str(p)])
 
-    # Añade sys.executable si es un python real (útil en dev)
-    if sys.executable and sys.executable.lower().endswith(("python.exe", "python")):
+    # Añadir sys.executable si es Python real (útil en dev)
+    if sys.executable and os.path.basename(sys.executable).lower().startswith("python"):
         candidates.insert(0, [sys.executable])
 
-    # Quitar duplicados preservando orden
+    # de-dup preservando orden
     seen = set()
     uniq: list[list[str]] = []
     for c in candidates:
-        key = tuple(c)
-        if key not in seen:
-            seen.add(key)
+        k = tuple(c)
+        if k not in seen:
+            seen.add(k)
             uniq.append(c)
 
-    # Intentar crear el venv con el primer candidato que responda
     for interp in uniq:
         if not _try_probe(interp):
             continue
@@ -169,14 +175,13 @@ def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
                 pybin = target_dir / "bin" / "python"
             return pybin, [str(pybin), "-m", "pip"]
 
-    # Si nada funcionó:
     _emit(log_cb, "No se encontró Python 3.10–3.12 en el sistema o no está en PATH/launcher.")
     _emit(log_cb, "Instala Python desde https://www.python.org/downloads/windows/ con:")
     _emit(log_cb, " - Add Python to PATH (checkbox)")
     _emit(log_cb, " - Instalar 'py launcher for all users'")
     raise RuntimeError("No se pudo crear el entorno virtual (¿Python instalado y accesible?).")
 
-# =================== FIN NUEVA IMPLEMENTACIÓN ROBUSTA ===================
+# =================== FIN IMPLEMENTACIÓN venv ===================
 
 
 def _pyinstaller_onedir(
@@ -229,8 +234,7 @@ def _pyinstaller_onedir(
     if code != 0:
         raise RuntimeError("PyInstaller falló; revisa los logs.")
 
-    # onedir típico: dist/app/
-    out_dir = dist / "app"
+    out_dir = dist / "app"  # onedir estándar
     if not out_dir.exists():
         raise FileNotFoundError("No se encontró carpeta onedir en dist/app")
     return out_dir
@@ -275,7 +279,6 @@ def build_from_zip(zip_path: Path, opts: BuildOptions, log_cb=None, phase_cb=Non
         onedir = _pyinstaller_onedir(src, pybin, pip_cmd, opts, log_cb)
 
         phase(85)
-        # Guardar en carpeta del ZIP
         dest_parent = zip_path.parent
         base_name = zip_path.stem
         out_dir = _copy_and_zip_onedir(onedir, dest_parent, base_name, log_cb)
