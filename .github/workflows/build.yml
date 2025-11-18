@@ -1,0 +1,68 @@
+name: Build Compiler App (Windows, PySide6 + QDarkStyle)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      use_spec:
+        description: "Usar pyinstaller.spec (recomendado)"
+        default: "true"
+        required: true
+      onefile_cli:
+        description: "Ignorar spec y construir --onefile (false para windowed onedir)"
+        default: "false"
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build with SPEC (windowed)
+        if: ${{ inputs.use_spec == 'true' }}
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm --workpath build --distpath dist pyinstaller.spec
+          Get-ChildItem -Recurse dist | % { $_.FullName }
+
+      - name: Build with CLI (override spec)
+        if: ${{ inputs.use_spec != 'true' }}
+        shell: pwsh
+        run: |
+          $cmd = @("pyinstaller","--clean","--noconfirm","--workpath","build","--distpath","dist","--windowed")
+          if ("${{ inputs.onefile_cli }}" -eq "true") { $cmd += "--onefile" }
+          if (Test-Path .\icon.ico) { $cmd += @("--icon","icon.ico") }
+          $cmd += "main.py"
+          echo "Ejecutando: $($cmd -join ' ')"
+          & $cmd
+          Get-ChildItem -Recurse dist | % { $_.FullName }
+
+      - name: Zip onedir (si aplica)
+        shell: pwsh
+        run: |
+          if (Test-Path .\dist\compiler-app) {
+            Compress-Archive -Path .\dist\compiler-app\* -DestinationPath .\dist\compiler-app-onedir.zip -Force
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-app-windows
+          path: dist/**
+          retention-days: 14
