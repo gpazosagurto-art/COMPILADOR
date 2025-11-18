@@ -1,142 +1,225 @@
 # main.py
-# Compilador GUI: seleccionas un ZIP con un proyecto Python y genera un .exe con PyInstaller.
-# PySide6 + QDarkStyle, barra de progreso, logs en vivo y footer centrado.
+# GUI PySide6 con QDarkStyle, 2 modos (ZIP / Carpeta + drag&drop), logs, progreso,
+# icono opcional y salida automática en la carpeta del ZIP o de la carpeta de proyecto.
 
 from pathlib import Path
 import sys
-import tempfile
 import shutil
+
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
 
 from builder_core import (
-    build_project_from_zip,
-    BuildOptions,
-    BuildSignals,
+    build_from_zip, build_from_dir, BuildOptions, BuildSignals
 )
 
 APP_TITLE = "🧱 Compilador .exe (PyInstaller)"
 FOOTER_TEXT = "© 2025 Gabriel Golker"
 
-class BuildWorker(QtCore.QThread):
-    def __init__(self, zip_path: Path, opts: BuildOptions, parent=None):
+class DropList(QtWidgets.QListWidget):
+    """Área para soltar archivos/carpeta; sólo muestra, la copia se hace en build."""
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.zip_path = zip_path
+        self.setAcceptDrops(True)
+        self.setSelectionMode(self.ExtendedSelection)
+        self.setAlternatingRowColors(True)
+
+    def dragEnterEvent(self, e: QtGui.QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e: QtGui.QDragMoveEvent):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e: QtGui.QDropEvent):
+        if e.mimeData().hasUrls():
+            for url in e.mimeData().urls():
+                p = Path(url.toLocalFile())
+                if p.exists():
+                    self.addItem(str(p))
+            e.acceptProposedAction()
+        else:
+            super().dropEvent(e)
+
+class BuildWorker(QtCore.QThread):
+    def __init__(self, mode_zip: bool, path: Path, opts: BuildOptions, parent=None):
+        super().__init__(parent)
+        self.mode_zip = mode_zip
+        self.path = path
         self.opts = opts
         self.signals = BuildSignals()
-        self._tmp_root = None
 
     def run(self):
-        # Fases para la barra de progreso
         try:
-            self._tmp_root = Path(tempfile.mkdtemp(prefix="compilegui_"))
-            self.signals.progress.emit(1)
-            out_zip = build_project_from_zip(
-                zip_file=self.zip_path,
-                tmp_base=self._tmp_root,
-                opts=self.opts,
-                log_cb=lambda t: self.signals.log.emit(t),
-                phase_cb=lambda p: self.signals.progress.emit(p),
-            )
-            self.signals.done.emit(True, str(out_zip), "")
+            if self.mode_zip:
+                out_dir = build_from_zip(
+                    zip_path=self.path,
+                    opts=self.opts,
+                    log_cb=lambda t: self.signals.log.emit(t),
+                    phase_cb=lambda p: self.signals.progress.emit(p),
+                )
+            else:
+                out_dir = build_from_dir(
+                    proj_dir=self.path,
+                    opts=self.opts,
+                    log_cb=lambda t: self.signals.log.emit(t),
+                    phase_cb=lambda p: self.signals.progress.emit(p),
+                )
+            self.signals.done.emit(True, str(out_dir), "")
         except Exception as e:
             self.signals.done.emit(False, "", str(e))
-        finally:
-            if self._tmp_root:
-                shutil.rmtree(self._tmp_root, ignore_errors=True)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(QtGui.QIcon("icon.ico") if Path("icon.ico").exists() else self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
-        self.resize(920, 640)
+        self.setMinimumSize(980, 680)
+        self._icon_path: Path | None = None
+        self._last_output_dir: Path | None = None
 
-        # Widgets
-        self.zip_label = QtWidgets.QLabel("ZIP del proyecto: (no seleccionado)")
-        self.zip_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        # Tabs: ZIP / Carpeta
+        tabs = QtWidgets.QTabWidget()
 
-        self.pick_btn = QtWidgets.QPushButton("Seleccionar ZIP…")
-        self.onefile_chk = QtWidgets.QCheckBox("Empaquetar en un solo archivo (--onefile)")
+        # --- Tab ZIP ---
+        zip_tab = QtWidgets.QWidget()
+        self.zip_path_lbl = QtWidgets.QLabel("ZIP del proyecto: (no seleccionado)")
+        self.zip_pick_btn = QtWidgets.QPushButton("Elegir ZIP…")
+
+        zip_l = QtWidgets.QVBoxLayout(zip_tab)
+        zip_l.addWidget(self.zip_path_lbl)
+        zip_l.addWidget(self.zip_pick_btn)
+        zip_l.addStretch(1)
+
+        # --- Tab Carpeta (armar) ---
+        dir_tab = QtWidgets.QWidget()
+        self.dir_path_lbl = QtWidgets.QLabel("Carpeta del proyecto: (no seleccionada)")
+        self.dir_pick_btn = QtWidgets.QPushButton("Elegir carpeta del proyecto…")
+
+        self.drop_list = DropList()
+        self.drop_list.setToolTip("Arrastra aquí archivos o carpetas para incluirlos en el proyecto (se copian tú mismo a esa carpeta).")
+
+        dir_l = QtWidgets.QVBoxLayout(dir_tab)
+        dir_l.addWidget(self.dir_path_lbl)
+        dir_l.addWidget(self.dir_pick_btn)
+        dir_l.addWidget(QtWidgets.QLabel("Arrastra archivos/carpeta a esta lista (sólo display):"))
+        dir_l.addWidget(self.drop_list, stretch=1)
+
+        tabs.addTab(zip_tab, "Desde ZIP")
+        tabs.addTab(dir_tab, "Armar carpeta")
+
+        # Controles comunes
         self.noconsole_chk = QtWidgets.QCheckBox("Ocultar consola (--noconsole)")
-        self.start_btn = QtWidgets.QPushButton("Generar .exe")
-        self.start_btn.setEnabled(False)
+        self.icon_btn = QtWidgets.QPushButton("Elegir icono (.ico)…")
+        self.icon_lbl = QtWidgets.QLabel("Sin icono")
+        icon_row = QtWidgets.QHBoxLayout()
+        icon_row.addWidget(self.icon_btn)
+        icon_row.addWidget(self.icon_lbl)
+        icon_row.addStretch(1)
 
+        self.start_btn = QtWidgets.QPushButton("Compilar (ONEDIR)")
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
-        font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
-        self.log.setFont(font)
+        mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self.log.setFont(mono)
 
-        self.save_btn = QtWidgets.QPushButton("Guardar artefacto…")
-        self.save_btn.setEnabled(False)
+        self.open_out_btn = QtWidgets.QPushButton("Abrir carpeta de salida")
+        self.open_out_btn.setEnabled(False)
 
-        self.footer = QtWidgets.QLabel(FOOTER_TEXT)
-        self.footer.setAlignment(QtCore.Qt.AlignHCenter)
-        footer_font = self.footer.font()
-        footer_font.setPointSize(9)
-        self.footer.setFont(footer_font)
+        footer = QtWidgets.QLabel("© 2025 Gabriel Golker")
+        footer.setAlignment(QtCore.Qt.AlignHCenter)
 
-        # Layout
-        top_row = QtWidgets.QHBoxLayout()
-        top_row.addWidget(self.pick_btn)
-        top_row.addWidget(self.onefile_chk)
-        top_row.addWidget(self.noconsole_chk)
-        top_row.addStretch(1)
-        top_row.addWidget(self.start_btn)
-
+        # Layout principal
         central = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(central)
-        v.addWidget(QtWidgets.QLabel(APP_TITLE))
-        v.addWidget(self.zip_label)
-        v.addLayout(top_row)
+        title = QtWidgets.QLabel(APP_TITLE)
+        f = title.font(); f.setPointSize(14); f.setBold(True); title.setFont(f)
+        v.addWidget(title)
+        v.addWidget(tabs, stretch=0)
+        v.addWidget(self.noconsole_chk)
+        v.addLayout(icon_row)
         v.addWidget(QtWidgets.QLabel("Logs"))
         v.addWidget(self.log, stretch=1)
         v.addWidget(self.progress)
-        v.addWidget(self.save_btn, alignment=QtCore.Qt.AlignRight)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.start_btn)
+        row.addStretch(1)
+        row.addWidget(self.open_out_btn)
+        v.addLayout(row)
         v.addSpacing(6)
-        v.addWidget(self.footer)
+        v.addWidget(footer)
         self.setCentralWidget(central)
 
         # Estado
         self._zip_path: Path | None = None
-        self._artifact_path: Path | None = None
+        self._proj_dir: Path | None = None
         self._worker: BuildWorker | None = None
 
         # Conexiones
-        self.pick_btn.clicked.connect(self.pick_zip)
+        self.zip_pick_btn.clicked.connect(self.pick_zip)
+        self.dir_pick_btn.clicked.connect(self.pick_dir)
+        self.icon_btn.clicked.connect(self.pick_icon)
         self.start_btn.clicked.connect(self.start_build)
-        self.save_btn.clicked.connect(self.save_artifact)
+        self.open_out_btn.clicked.connect(self.open_output_folder)
 
-        # Arranque visual
         self.statusBar().showMessage("Listo.")
 
-    # --- UI actions ---
+    # -------- acciones --------
 
     def pick_zip(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Seleccionar ZIP del proyecto", "", "ZIP (*.zip)")
-        if path:
-            self._zip_path = Path(path)
-            self.zip_label.setText(f"ZIP del proyecto: {self._zip_path}")
-            self.start_btn.setEnabled(True)
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Seleccionar ZIP del proyecto", "", "ZIP (*.zip)")
+        if p:
+            self._zip_path = Path(p)
+            self.zip_path_lbl.setText(f"ZIP del proyecto: {self._zip_path}")
+            # Modo ZIP activo, limpia el otro
+            self._proj_dir = None
+            self.dir_path_lbl.setText("Carpeta del proyecto: (no seleccionada)")
+
+    def pick_dir(self):
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Seleccionar carpeta del proyecto", "")
+        if p:
+            self._proj_dir = Path(p)
+            self.dir_path_lbl.setText(f"Carpeta del proyecto: {self._proj_dir}")
+            # Modo DIR activo, limpia el otro
+            self._zip_path = None
+            self.zip_path_lbl.setText("ZIP del proyecto: (no seleccionado)")
+
+    def pick_icon(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Seleccionar icono .ico", "", "Icono (*.ico)")
+        if p:
+            self._icon_path = Path(p)
+            self.icon_lbl.setText(str(self._icon_path))
+            self.setWindowIcon(QtGui.QIcon(str(self._icon_path)))
 
     def start_build(self):
-        if not self._zip_path:
-            return
         self.log.clear()
         self.progress.setValue(0)
-        self._artifact_path = None
-        self.save_btn.setEnabled(False)
+        self.open_out_btn.setEnabled(False)
+        self._last_output_dir = None
+
+        if self._zip_path:
+            mode_zip = True
+            path = self._zip_path
+        elif self._proj_dir:
+            mode_zip = False
+            path = self._proj_dir
+        else:
+            QtWidgets.QMessageBox.warning(self, "Falta fuente", "Selecciona un ZIP o una carpeta de proyecto.")
+            return
 
         opts = BuildOptions(
-            onefile=self.onefile_chk.isChecked(),
             noconsole=self.noconsole_chk.isChecked(),
+            icon_path=str(self._icon_path) if self._icon_path else None
         )
-        self._worker = BuildWorker(self._zip_path, opts, self)
+
+        self._worker = BuildWorker(mode_zip, path, opts, self)
         self._worker.signals.log.connect(self.append_log)
         self._worker.signals.progress.connect(self.progress.setValue)
         self._worker.signals.done.connect(self.build_done)
@@ -146,45 +229,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.start()
 
     def append_log(self, text: str):
-        self.log.appendPlainText(text.rstrip())
+        self.log.appendPlainText(text)
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
-    def build_done(self, ok: bool, artifact_path: str, err: str):
+    def build_done(self, ok: bool, out_path: str, err: str):
         self.toggle_inputs(True)
-        self.progress.setValue(100 if ok else self.progress.value())
         if ok:
-            self._artifact_path = Path(artifact_path)
-            self.statusBar().showMessage("¡Build terminado!")
-            self.append_log("\n=== Build finalizado con éxito ===")
-            self.append_log(f"Artefacto: {self._artifact_path}")
-            self.save_btn.setEnabled(True)
-            QtWidgets.QMessageBox.information(self, "Éxito", "Build finalizado. Puedes guardar el artefacto.")
+            self.progress.setValue(100)
+            self._last_output_dir = Path(out_path)
+            self.statusBar().showMessage("Build finalizado")
+            self.append_log("\n=== Build finalizado ===")
+            self.append_log(f"Salida: {self._last_output_dir}")
+            self.open_out_btn.setEnabled(True)
+            QtWidgets.QMessageBox.information(self, "Éxito", f"Build listo en:\n{self._last_output_dir}\nY el ZIP al lado.")
         else:
             self.statusBar().showMessage("Error en build")
             self.append_log("\n=== ERROR ===")
             self.append_log(err)
             QtWidgets.QMessageBox.critical(self, "Error", err)
 
-    def toggle_inputs(self, enabled: bool):
-        self.pick_btn.setEnabled(enabled)
-        self.onefile_chk.setEnabled(enabled)
-        self.noconsole_chk.setEnabled(enabled)
-        self.start_btn.setEnabled(enabled)
+    def open_output_folder(self):
+        if self._last_output_dir and self._last_output_dir.exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self._last_output_dir)))
 
-    def save_artifact(self):
-        if not self._artifact_path or not self._artifact_path.exists():
-            return
-        dest, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Guardar artefacto", self._artifact_path.name, "ZIP (*.zip)")
-        if dest:
-            try:
-                shutil.copyfile(self._artifact_path, dest)
-                QtWidgets.QMessageBox.information(self, "Guardado", "Artefacto guardado correctamente.")
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Error guardando", str(e))
+    def toggle_inputs(self, enabled: bool):
+        self.zip_pick_btn.setEnabled(enabled)
+        self.dir_pick_btn.setEnabled(enabled)
+        self.icon_btn.setEnabled(enabled)
+        self.noconsole_chk.setEnabled(enabled)
+        # El botón de compilar sólo si hay fuente elegida
+        self.start_btn.setEnabled(enabled)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    # QDarkStyle para PySide6
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
     w = MainWindow()
     w.show()
