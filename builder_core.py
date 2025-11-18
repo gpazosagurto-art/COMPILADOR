@@ -13,28 +13,37 @@ import tempfile
 
 from PySide6 import QtCore
 
+
 @dataclass
 class BuildOptions:
     noconsole: bool = False
     icon_path: str | None = None  # .ico opcional
+
 
 class BuildSignals(QtCore.QObject):
     log = QtCore.Signal(str)
     progress = QtCore.Signal(int)
     done = QtCore.Signal(bool, str, str)  # ok, out_dir_or_zip, error
 
+
 def _emit(log_cb, msg: str):
     (log_cb or print)(msg, flush=True)
+
 
 def _run(cmd: list[str], cwd: Path | None, env: dict | None, log_cb) -> int:
     _emit(log_cb, f"$ {' '.join(cmd)}")
     proc = subprocess.Popen(
-        cmd, cwd=str(cwd) if cwd else None, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
     for line in proc.stdout:
         _emit(log_cb, line.rstrip())
     return proc.wait()
+
 
 def _safe_unzip(zip_file: Path, dest: Path):
     with zipfile.ZipFile(zip_file) as z:
@@ -44,6 +53,7 @@ def _safe_unzip(zip_file: Path, dest: Path):
                 raise ValueError(f"Ruta peligrosa en ZIP: {m.filename}")
         z.extractall(dest)
 
+
 def _detect_root_with_app_py(root: Path) -> Path:
     if (root / "app.py").exists():
         return root
@@ -52,22 +62,122 @@ def _detect_root_with_app_py(root: Path) -> Path:
             return p
     return root
 
+
+# ===================== NUEVA IMPLEMENTACIÓN ROBUSTA =====================
+
 def _create_venv(target_dir: Path, log_cb) -> tuple[Path, list[str]]:
-    candidates = []
-    if sys.executable and sys.executable.lower().endswith("python.exe"):
-        candidates.append(sys.executable)
-    candidates += ["py", "python"]
-    for py in candidates:
+    """
+    Busca un intérprete de Python 3.10–3.12 en Windows de forma robusta y crea un venv.
+    Orden de búsqueda:
+      1) py -0p   (launcher oficial; lista rutas instaladas)
+      2) py -3.12 / -3.11 / -3.10
+      3) where python / where py
+      4) Escaneo de rutas típicas (AppData y Program Files)
+    En Linux/WSL/macOS, también intentará 'python3'.
+    Devuelve: (ruta_python_del_venv, comando_pip_del_venv)
+    """
+    import re
+    from shutil import which
+
+    def _try_probe(cmd: list[str]) -> bool:
+        _emit(log_cb, f"Probando intérprete: {' '.join(cmd)}")
         try:
-            code = _run([py, "-m", "venv", str(target_dir)], None, None, log_cb)
-            if code == 0:
-                pybin = target_dir / "Scripts" / "python.exe"
-                if not pybin.exists():
-                    pybin = target_dir / "bin" / "python"
-                return pybin, [str(pybin), "-m", "pip"]
+            code = _run(cmd + ["-c", "import sys; print(sys.version)"], None, None, log_cb)
+            return code == 0
+        except Exception:
+            return False
+
+    candidates: list[list[str]] = []
+
+    # 1) py -0p (si existe launcher)
+    if which("py"):
+        try:
+            out = subprocess.check_output(["py", "-0p"], text=True, stderr=subprocess.STDOUT)
+            # Líneas tipo: " -3.12-64  C:\Path\Python312\python.exe"
+            for line in out.splitlines():
+                m = re.search(r"(\d\.\d+).*(python\.exe)", line, re.I)
+                if m:
+                    ver = m.group(1)
+                    if ver in {"3.10", "3.11", "3.12"}:
+                        path = line.strip().split()[-1]
+                        candidates.append([path])
         except Exception:
             pass
-    raise RuntimeError("No se pudo crear el entorno virtual (¿Python instalado?).")
+        # 2) py -3.12/-3.11/-3.10
+        for v in ("3.12", "3.11", "3.10"):
+            candidates.append(["py", f"-{v}"])
+
+    # 3) where python / where py (Windows) o which python3/python (otros)
+    if os.name == "nt":
+        for exe in ("python", "py"):
+            try:
+                out = subprocess.check_output(["where", exe], text=True, stderr=subprocess.STDOUT)
+                for line in out.splitlines():
+                    p = line.strip()
+                    if p.lower().endswith("python.exe"):
+                        candidates.append([p])
+                    elif p.lower().endswith("py.exe"):
+                        for v in ("3.12", "3.11", "3.10"):
+                            candidates.append([p, f"-{v}"])
+            except Exception:
+                pass
+    else:
+        for exe in ("python3.12", "python3.11", "python3.10", "python3", "python"):
+            if which(exe):
+                candidates.append([exe])
+
+    # 4) Rutas típicas de instalación en Windows
+    if os.name == "nt":
+        probable_dirs = []
+        for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)")):
+            if not base:
+                continue
+            probable_dirs += [
+                Path(base) / "Programs" / "Python" / "Python312" / "python.exe",
+                Path(base) / "Programs" / "Python" / "Python311" / "python.exe",
+                Path(base) / "Programs" / "Python" / "Python310" / "python.exe",
+                Path(base) / "Python312" / "python.exe",
+                Path(base) / "Python311" / "python.exe",
+                Path(base) / "Python310" / "python.exe",
+            ]
+        for p in probable_dirs:
+            if p.exists():
+                candidates.append([str(p)])
+
+    # Añade sys.executable si es un python real (útil en dev)
+    if sys.executable and sys.executable.lower().endswith(("python.exe", "python")):
+        candidates.insert(0, [sys.executable])
+
+    # Quitar duplicados preservando orden
+    seen = set()
+    uniq: list[list[str]] = []
+    for c in candidates:
+        key = tuple(c)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+
+    # Intentar crear el venv con el primer candidato que responda
+    for interp in uniq:
+        if not _try_probe(interp):
+            continue
+        _emit(log_cb, f"Usando intérprete: {' '.join(interp)}")
+        code = _run(interp + ["-m", "venv", str(target_dir)], None, None, log_cb)
+        if code == 0:
+            pybin = target_dir / "Scripts" / "python.exe"
+            if not pybin.exists():
+                pybin = target_dir / "bin" / "python"
+            return pybin, [str(pybin), "-m", "pip"]
+
+    # Si nada funcionó:
+    _emit(log_cb, "No se encontró Python 3.10–3.12 en el sistema o no está en PATH/launcher.")
+    _emit(log_cb, "Instala Python desde https://www.python.org/downloads/windows/ con:")
+    _emit(log_cb, " - Add Python to PATH (checkbox)")
+    _emit(log_cb, " - Instalar 'py launcher for all users'")
+    raise RuntimeError("No se pudo crear el entorno virtual (¿Python instalado y accesible?).")
+
+# =================== FIN NUEVA IMPLEMENTACIÓN ROBUSTA ===================
+
 
 def _pyinstaller_onedir(
     proj: Path, pybin: Path, pip_cmd: list[str], opts: BuildOptions, log_cb
@@ -86,10 +196,18 @@ def _pyinstaller_onedir(
     else:
         _emit(log_cb, "Aviso: no hay requirements.txt; continuo con stdlib.")
 
-    base = [str(pybin), "-m", "PyInstaller", "--noconfirm", "--clean",
-            "--distpath", str(dist), "--workpath", str(build)]
-    # Siempre ONEDIR
-    # (No añadimos --onefile)
+    base = [
+        str(pybin),
+        "-m",
+        "PyInstaller",
+        "--noconfirm",
+        "--clean",
+        "--distpath",
+        str(dist),
+        "--workpath",
+        str(build),
+    ]
+    # Siempre ONEDIR (no añadimos --onefile)
     if opts.noconsole:
         base.append("--noconsole")
     if opts.icon_path:
@@ -102,7 +220,11 @@ def _pyinstaller_onedir(
             if line and ";" in line:
                 base += ["--add-data", line]
 
-    target = str(proj / "pyinstaller.spec") if (proj / "pyinstaller.spec").exists() else str(proj / "app.py")
+    target = (
+        str(proj / "pyinstaller.spec")
+        if (proj / "pyinstaller.spec").exists()
+        else str(proj / "app.py")
+    )
     code = _run(base + [target], cwd=proj, env=None, log_cb=log_cb)
     if code != 0:
         raise RuntimeError("PyInstaller falló; revisa los logs.")
@@ -112,6 +234,7 @@ def _pyinstaller_onedir(
     if not out_dir.exists():
         raise FileNotFoundError("No se encontró carpeta onedir en dist/app")
     return out_dir
+
 
 def _copy_and_zip_onedir(onedir: Path, dest_parent: Path, base_name: str, log_cb) -> Path:
     out_dir = dest_parent / f"{base_name}_onedir"
@@ -126,6 +249,7 @@ def _copy_and_zip_onedir(onedir: Path, dest_parent: Path, base_name: str, log_cb
     _emit(log_cb, f"Salida onedir: {out_dir}")
     _emit(log_cb, f"Zip: {out_zip}")
     return out_dir  # devolvemos carpeta principal
+
 
 # ----------------- API PÚBLICA -----------------
 
@@ -160,6 +284,7 @@ def build_from_zip(zip_path: Path, opts: BuildOptions, log_cb=None, phase_cb=Non
         return out_dir
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+
 
 def build_from_dir(proj_dir: Path, opts: BuildOptions, log_cb=None, phase_cb=None) -> Path:
     """Compila desde una CARPETA. Guarda onedir/zip en ESA MISMA carpeta."""
