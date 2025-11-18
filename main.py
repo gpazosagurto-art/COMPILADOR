@@ -4,7 +4,6 @@
 
 from pathlib import Path
 import sys
-import shutil
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
@@ -16,12 +15,13 @@ from builder_core import (
 APP_TITLE = "🧱 Compilador .exe (PyInstaller)"
 FOOTER_TEXT = "© 2025 Gabriel Golker"
 
+
 class DropList(QtWidgets.QListWidget):
     """Área para soltar archivos/carpeta; sólo muestra, la copia se hace en build."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setSelectionMode(self.ExtendedSelection)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)  # <-- FIX
         self.setAlternatingRowColors(True)
 
     def dragEnterEvent(self, e: QtGui.QDragEnterEvent):
@@ -45,6 +45,7 @@ class DropList(QtWidgets.QListWidget):
             e.acceptProposedAction()
         else:
             super().dropEvent(e)
+
 
 class BuildWorker(QtCore.QThread):
     def __init__(self, mode_zip: bool, path: Path, opts: BuildOptions, parent=None):
@@ -74,6 +75,7 @@ class BuildWorker(QtCore.QThread):
         except Exception as e:
             self.signals.done.emit(False, "", str(e))
 
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -101,12 +103,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dir_pick_btn = QtWidgets.QPushButton("Elegir carpeta del proyecto…")
 
         self.drop_list = DropList()
-        self.drop_list.setToolTip("Arrastra aquí archivos o carpetas para incluirlos en el proyecto (se copian tú mismo a esa carpeta).")
+        self.drop_list.setToolTip(
+            "Arrastra aquí archivos o carpetas para incluirlos en el proyecto "
+            "(solo listado). Copia los archivos tú mismo a la carpeta elegida si quieres que queden allí."
+        )
 
         dir_l = QtWidgets.QVBoxLayout(dir_tab)
         dir_l.addWidget(self.dir_path_lbl)
         dir_l.addWidget(self.dir_pick_btn)
-        dir_l.addWidget(QtWidgets.QLabel("Arrastra archivos/carpeta a esta lista (sólo display):"))
+        dir_l.addWidget(QtWidgets.QLabel("Arrastra archivos/carpeta a esta lista (solo display):"))
         dir_l.addWidget(self.drop_list, stretch=1)
 
         tabs.addTab(zip_tab, "Desde ZIP")
@@ -133,14 +138,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_out_btn = QtWidgets.QPushButton("Abrir carpeta de salida")
         self.open_out_btn.setEnabled(False)
 
-        footer = QtWidgets.QLabel("© 2025 Gabriel Golker")
+        footer = QtWidgets.QLabel(FOOTER_TEXT)
         footer.setAlignment(QtCore.Qt.AlignHCenter)
 
         # Layout principal
         central = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(central)
         title = QtWidgets.QLabel(APP_TITLE)
-        f = title.font(); f.setPointSize(14); f.setBold(True); title.setFont(f)
+        f = title.font()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
         v.addWidget(title)
         v.addWidget(tabs, stretch=0)
         v.addWidget(self.noconsole_chk)
@@ -257,8 +265,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dir_pick_btn.setEnabled(enabled)
         self.icon_btn.setEnabled(enabled)
         self.noconsole_chk.setEnabled(enabled)
-        # El botón de compilar sólo si hay fuente elegida
         self.start_btn.setEnabled(enabled)
+
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
@@ -266,6 +274,7 @@ def main():
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
